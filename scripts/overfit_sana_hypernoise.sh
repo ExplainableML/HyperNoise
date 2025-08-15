@@ -8,7 +8,7 @@ export OMP_NUM_THREADS=12
 python -m torch.distributed.run \
     --nnodes=1 \
     --nproc_per_node=1 \
-    --master_port=25841 \
+    --master_port=25831 \
     main.py \
     --task="example-prompts" \
     --model=sana \
@@ -23,8 +23,8 @@ python -m torch.distributed.run \
     --warmup_steps=100 \
     --reg_weight=0.5 \
     --latent_type="one" \
-    --epochs=5 \
+    --epochs=10000 \
     --save_dir="./outputs" \
-    --log_every=10 \
-    --save_every=10 \
+    --log_every=500 \
+    --save_every=5000 \
     --memsave
