@@ -1,0 +1,6 @@
+/data
+/outputs
+/ckpts
+/.cache
+
+__pycache__

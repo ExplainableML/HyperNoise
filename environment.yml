@@ -1,0 +1,25 @@
+name: hypernoise
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pytorch=2.3
+  - torchvision=0.18.0
+  - pytorch-cuda
+  - pytorch-lightning=2.2
+  - pip
+  # - pip:
+  #   - -e git+https://github.com/lucaeyring/memsave_torch.git#egg=memsave_torch
+  #   - datasets==2.18
+  #   - diffusers==0.33.1
+  #   - hpsv2==1.2
+  #   - image-reward==1.5
+  #   - open-clip-torch
+  #   - blobfile
+  #   - openai-clip
+  #   - setuptools
+  #   - peft<0.16
+  #   - wandb
+  #   - bitsandbytes
