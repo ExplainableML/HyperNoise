@@ -72,7 +72,7 @@ For a complete list of arguments, see `arguments.py`, as well as `main.py` and `
 ## Citation
 
 ```bibtex
-@article{eyring2025noise,
+@article{eyring2025hypernoise,
   author    = {Eyring, Luca and Karthik, Shyamgopal and Dosovitskiy, Alexey and Ruiz, Nataniel and Akata, Zeynep},
   title     = {Noise Hypernetworks: Amortizing Test-Time Compute in Diffusion Models},
   journal   = {arXiv preprint},
