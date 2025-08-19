@@ -19,6 +19,13 @@ First, install the necessary dependencies using the provided requirements file, 
 mamaba env create -f environment.yml
 ```
 
+Additionally to load part of the training promtps. clone the T2I-CompBench repo into the parent directory as follows.
+
+```
+cd ..
+git clone https://github.com/Karine-Huang/T2I-CompBench.git
+```
+
 ## Quick Start
 
 To use the trained Noise Hypernetwork for SANA-Sprint, you can use either `minimal_sana_inference.py` for a minimal implementation or `sana_inference.py` to generate a grid of images with and without HypeNoise. The result should be the same as plotted in Figure 8 in the paper.
@@ -45,10 +52,10 @@ For these experiments, follow the corresponding files in `scripts/`.
 
 ### Training Parameters
 - **`--lr`**: Learning rate (default: 1e-3)
-- **`--epochs`**: Number of training epochs (default: 50)
-- **`--batch_size`**: Training batch size (default: 32)
-- **`--accumulation_steps`**: Gradient accumulation steps (default: 1)
-- **`--optim`**: Optimizer (`sgd`, `adam`, `adamw`, `lbfgs`)
+- **`--epochs`**: Number of training epochs (default: 30)
+- **`--batch_size`**: Training batch size (default: 18)
+- **`--accumulation_steps`**: Gradient accumulation steps (default: 3)
+- **`--optim`**: Optimizer (`sgd`, `adam`, `adamw`) (default: `sgd`)
 
 ### LoRA Configuration
 - **`--lora_rank`**: LoRA rank for adapter layers (default: 128)
@@ -56,10 +63,10 @@ For these experiments, follow the corresponding files in `scripts/`.
 - **`--last_layer_name`**: Target layer for LoRA (`proj_out` for SANA, `conv_out` for SD-Turbo)
 
 ### Reward Functions
-- **`--enable_hps`** / **`--hps_weighting`**: Human Preference Score v2 for visual quality (default: 5.0)
-- **`--enable_imagereward`** / **`--imagereward_weighting`**: ImageReward for prompt alignment (default: 1.0)
+- **`--enable_hps`** / **`--hps_weighting`**: Human Preference Score v2 for human preferences (visual quality) (default: 5.0)
+- **`--enable_imagereward`** / **`--imagereward_weighting`**: ImageReward  for human preferences (prompt alignment) (default: 1.0)
 - **`--enable_clip`** / **`--clip_weighting`**: CLIP score for text-image similarity (default: 0.01)
-- **`--enable_pickscore`** / **`--pickscore_weighting`**: PickScore for human preferences (default: 0.05)
+- **`--enable_pickscore`** / **`--pickscore_weighting`**: PickScore for human preferences (visual quality) (default: 0.05)
 
 ### Memory and Performance
 - **`--use_checkpoint`**: Enable gradient checkpointing for memory efficiency
