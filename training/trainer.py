@@ -42,10 +42,10 @@ class TrainingConfig:
     latent_type: str = "inf"  # "one", "multi", "inf", "batch"
     reg_type: str = "l2"  # "l2", "kl"
     enable_modulate_noise: bool = True
-    grad_normalization: bool = False
     one_prompt_per_batch: bool = False
-    norm_dims: List[int] = None  # Dimensions for norm computation, will be set by model
     use_checkpoint: bool = True  # Whether to use gradient checkpointing
+    viz_noise: bool = False # Whether to visualize the modulated noise
+    compute_geneval_rewards: bool = True  # Whether to compute geneval metrics
 
 
 @dataclass
@@ -64,8 +64,10 @@ class ModelFunctions:
     """Model-specific functions."""
     prepare_latents_fn: Callable  # (trainer, init_latents, batch_size) -> (latents, extra_data)
     encode_prompt_fn: Callable    # (trainer, prompts) -> encoding_data
-    transformer_forward_fn: Callable  # (trainer, latents, encoding_data, extra_data) -> pred_latents
+    noise_network_forward_fn: Callable  # (trainer, latents, encoding_data, extra_data) -> pred_latents
+    get_noise_network: Callable  # (trainer) -> noise_network
     apply_fn: Callable           # (trainer, latents, encoding_data) -> images
+    model_name: str
     init_guidance_fn: Optional[Callable] = None  # (trainer) -> guidance
 
 
@@ -159,8 +161,7 @@ class NoiseNetworkTrainer:
         if self.config.reg_type == "l2":
             return torch.mean(torch.square(pred_latents))
         else:
-            norm_dims = self.config.norm_dims or list(range(1, len(latents.shape)))
-            latent_norm = torch.linalg.vector_norm(latents, dim=norm_dims)
+            latent_norm = torch.linalg.vector_norm(latents, dim=list(range(1, len(pred_latents.shape))))
             regularization = (
                 0.5 * latent_norm**2 - (self.latent_dim - 1) * torch.log(latent_norm + 1e-8)
             )
@@ -176,10 +177,7 @@ class NoiseNetworkTrainer:
         
         # Compute reward losses
         for reward_loss in self.reward_losses:
-            if self.config.grad_normalization:
-                loss = GradNormFunction.gradnorm(reward_loss(preprocessed_image, prompts))
-            else:
-                loss = reward_loss(preprocessed_image, prompts, images)
+            loss = reward_loss(preprocessed_image, prompts, images)
             total_loss = total_loss + loss * reward_loss.weighting
             metrics[reward_loss.name] = loss.detach().cpu().item()
         
@@ -191,8 +189,7 @@ class NoiseNetworkTrainer:
         
         # Add norm metric
         if latents is not None:
-            norm_dims = self.config.norm_dims or list(range(1, len(latents.shape)))
-            latent_norm = torch.linalg.vector_norm(latents, dim=norm_dims)
+            latent_norm = torch.linalg.vector_norm(latents, dim=list(range(1, len(latents.shape))))
             metrics["norm"] = latent_norm.detach().cpu().mean().item()
         
         metrics["total"] = total_loss.detach().cpu().item()
@@ -230,15 +227,11 @@ class NoiseNetworkTrainer:
         formatted_metrics = {k: f"{v:.4f}" for k, v in metrics.items()}
         logging.info(f"{prefix}Step {step}: {formatted_metrics}")
 
-    def _load_eval_prompts(self, filepath: str = "assets/example_prompts.txt") -> List[str]:
-        """Load evaluation prompts for current rank."""
+    def _load_visualization_eval_prompts(self, filepath: str = "assets/example_prompts.txt") -> List[str]:
+        """Load evaluation prompts."""
         with open(filepath, "r") as f:
             prompts = [line.strip() for line in f.readlines()]
-        
-        # Split prompts for current rank
-        start_idx = self.runtime.rank * (len(prompts) // self.runtime.world_size)
-        end_idx = (self.runtime.rank + 1) * (len(prompts) // self.runtime.world_size)
-        return prompts[start_idx:end_idx]
+        return prompts
 
     def step(self, init_latents: torch.Tensor, prompts: List[str], iter_step: int) -> Tuple[Dict[str, float], Dict[str, float]]:
         """Perform one training step."""
@@ -250,23 +243,23 @@ class NoiseNetworkTrainer:
         
         pred_latents = None
         if self.train_type == "noise":
-            self.pipe.transformer.module.train()
-            self.pipe.transformer.module.enable_adapters()
-            
+            self.model_fns.get_noise_network(self).module.train()
+            self.model_fns.get_noise_network(self).module.enable_adapters()
+
             # Forward pass through transformer (with optional checkpointing)
             if self.config.use_checkpoint:
                 def callable_fn():
-                    return self.model_fns.transformer_forward_fn(self, latents, encoding_data, extra_data)
+                    return self.model_fns.noise_network_forward_fn(self, latents, encoding_data, extra_data)
                 pred_latents = torch.utils.checkpoint.checkpoint(callable_fn, use_reentrant=False)
             else:
-                pred_latents = self.model_fns.transformer_forward_fn(self, latents, encoding_data, extra_data)
+                pred_latents = self.model_fns.noise_network_forward_fn(self, latents, encoding_data, extra_data)
             
             if self.config.enable_modulate_noise:
                 latents = pred_latents + latents
             else:
                 latents = pred_latents
-            self.pipe.transformer.module.disable_adapters()
-        
+            self.model_fns.get_noise_network(self).module.disable_adapters()
+
         # Generate images
         images = self.model_fns.apply_fn(self, latents, encoding_data)
         
@@ -275,8 +268,8 @@ class NoiseNetworkTrainer:
         total_loss /= self.config.accumulation_steps
         
         # Backward pass
-        self.pipe.transformer.module.train()
-        self.pipe.transformer.module.enable_adapters()
+        self.model_fns.get_noise_network(self).module.train()
+        self.model_fns.get_noise_network(self).module.enable_adapters()
         total_loss.backward()
         
         # Clean up intermediate tensors
@@ -289,13 +282,13 @@ class NoiseNetworkTrainer:
         # Optimizer step
         if (iter_step + 1) % self.config.accumulation_steps == 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.pipe.transformer.parameters(), max_norm=float('inf'), norm_type=2
+                self.model_fns.get_noise_network(self).parameters(), max_norm=float('inf'), norm_type=2
             )
             metrics["grad_norm"] = grad_norm.item()
-            
-            torch.nn.utils.clip_grad_norm_(self.pipe.transformer.parameters(), self.config.grad_clip)
-            
-            if has_nan_gradients(self.pipe.transformer):
+
+            torch.nn.utils.clip_grad_norm_(self.model_fns.get_noise_network(self).parameters(), self.config.grad_clip)
+
+            if has_nan_gradients(self.model_fns.get_noise_network(self)):
                 logging.warning("Skipping batch due to NaN gradients")
                 self.optimizer.zero_grad(set_to_none=True)
                 return metrics, {}
@@ -309,74 +302,42 @@ class NoiseNetworkTrainer:
         
         return metrics, {k: v for k, v in metrics.items() if k in [loss.name for loss in self.reward_losses]}
 
-    def eval_step(self, init_latents: torch.Tensor, batch_size: int, prompts: List[str], 
-                  noise_prompts: Optional[List[str]] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Perform one evaluation step."""
-        images = []
-        eval_metrics = defaultdict(list)
+    def _generate_images(self, init_latents: torch.Tensor, prompts: List[str], 
+                        noise_prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate images from latents and prompts."""
+        # Prepare latents
+        latents, extra_data = self.model_fns.prepare_latents_fn(self, init_latents, len(prompts))
         
-        self.pipe.transformer.module.eval()
-        with torch.inference_mode():
-            for batch_start in range(0, len(prompts), batch_size):
-                batch_end = min(batch_start + batch_size, len(prompts))
-                batch_prompts = prompts[batch_start:batch_end]
-                batch_init_latents = init_latents[batch_start:batch_end]
-                
-                # Prepare latents
-                batch_latents, extra_data = self.model_fns.prepare_latents_fn(
-                    self, batch_init_latents, len(batch_prompts)
-                )
-                
-                # Encode prompts
-                encoding_data = self.model_fns.encode_prompt_fn(self, batch_prompts)
-                
-                # Handle noise prompts if provided
-                if noise_prompts is not None:
-                    batch_noise_prompts = noise_prompts[batch_start:batch_end]
-                    noise_encoding_data = self.model_fns.encode_prompt_fn(self, batch_noise_prompts)
-                else:
-                    noise_encoding_data = encoding_data
-                
-                # Generate latents if using noise network
-                if self.train_type == "noise":
-                    self.pipe.transformer.module.enable_adapters()
-                    pred_latents = self.model_fns.transformer_forward_fn(
-                        self, batch_latents, noise_encoding_data, extra_data
-                    )
-                    
-                    if self.config.enable_modulate_noise:
-                        batch_latents = pred_latents + batch_latents
-                    else:
-                        batch_latents = pred_latents
-                    
-                    self.pipe.transformer.module.disable_adapters()
-                
-                # Generate images
-                batch_images = self.model_fns.apply_fn(self, batch_latents, encoding_data)
-                
-                # Compute metrics
-                total_loss, metrics = self._compute_total_loss(batch_images, batch_prompts)
-                images.append(batch_images.detach())
-                
-                for key, value in metrics.items():
-                    eval_metrics[key].append(value)
+        # Encode prompts
+        encoding_data = self.model_fns.encode_prompt_fn(self, prompts)
         
-        # Aggregate metrics
-        aggregated_metrics = {key: sum(values) / len(values) for key, values in eval_metrics.items()}
-        eval_images = torch.cat(images, dim=0)
+        if prompts != noise_prompts:
+            noise_encoding_data = self.model_fns.encode_prompt_fn(self, noise_prompts)
+        else:
+            noise_encoding_data = encoding_data
         
-        self.pipe.transformer.module.train()
-        self.pipe.transformer.module.enable_adapters()
+        if self.train_type == "noise":
+            self.model_fns.get_noise_network(self).module.enable_adapters()
+            pred_latents = self.model_fns.noise_network_forward_fn(
+                self, latents, noise_encoding_data, extra_data
+            )
+            
+            if self.config.enable_modulate_noise:
+                latents = pred_latents + latents
+                delta_latents = pred_latents
+            else:
+                delta_latents = pred_latents - latents
+                latents = pred_latents
+            self.model_fns.get_noise_network(self).module.disable_adapters()
+        else:
+            delta_latents = latents
         
-        # Cleanup
-        del batch_images, images, total_loss
-        self._cleanup_memory()
-        
-        return eval_images, aggregated_metrics
+        images = self.model_fns.apply_fn(self, latents, encoding_data)
+        return images, latents, delta_latents
 
-    def eval_rewards(self, prompts: List[str], noise_prompts: List[str], 
-                    batch_size: int = 8, num_samples: int = 1) -> Dict[str, float]:
-        """Evaluate rewards for given prompts."""
+    def gen_images_and_eval_rewards(self, prompts: List[str], noise_prompts: List[str], 
+                    batch_size: int = 8, num_samples: int = 1, return_imgs: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
+        """Generate images and evaluate rewards for given prompts."""
         self._cleanup_memory()
         
         # Split prompts across devices
@@ -384,13 +345,16 @@ class NoiseNetworkTrainer:
         end_idx = (self.runtime.rank + 1) * (len(prompts) // self.runtime.world_size)
         device_prompts = prompts[start_idx:end_idx]
         device_noise_prompts = noise_prompts[start_idx:end_idx]
-        
+
         all_rewards = {reward_loss.name: [] for reward_loss in self.reward_losses}
         all_rewards["total"] = []
+        images = []
+        noises = []
+        delta_noises = []
         
         with torch.inference_mode():
-            self.pipe.transformer.module.eval()
-            
+            self.model_fns.get_noise_network(self).module.eval()
+
             for batch_start in range(0, len(device_prompts), batch_size):
                 batch_end = min(batch_start + batch_size, len(device_prompts))
                 batch_prompts = device_prompts[batch_start:batch_end]
@@ -399,16 +363,50 @@ class NoiseNetworkTrainer:
                 for i in range(num_samples):
                     # Generate and evaluate
                     generator = torch.Generator(self.runtime.device).manual_seed(self.runtime.seed + i)
-                    init_latents = torch.randn(
-                        [len(batch_prompts), *self.latent_shape],
-                        device=self.runtime.device,
-                        dtype=self.runtime.dtype,
-                        generator=generator,
-                    )
-                    images, latents = self._generate_images(init_latents, batch_prompts, batch_noise_prompts)
-                    
+                    if self.config.latent_type == "one":
+                        init_latents = torch.stack([torch.randn(
+                            self.latent_shape,
+                            device=self.runtime.device,
+                            dtype=self.runtime.dtype,
+                            generator=generator,
+                        )] * len(batch_prompts))
+                    else:
+                        init_latents = torch.randn(
+                            [len(batch_prompts), *self.latent_shape],
+                            device=self.runtime.device,
+                            dtype=self.runtime.dtype,
+                            generator=generator,
+                        )
+                    batch_images, batch_noises, batch_delta_noises = self._generate_images(init_latents, batch_prompts, batch_noise_prompts)
+                    if return_imgs:
+                        images.append(batch_images)
+                        if self.model_fns.model_name == "sd-turbo":
+                            batch_noises = batch_noises / self.pipe.vae.config.scaling_factor
+                            batch_delta_noises = batch_delta_noises / self.pipe.vae.config.scaling_factor
+                        elif self.model_fns.model_name == "flux":
+                            # reshape noises accordingly
+                            batch_noises = self.pipe._unpack_latents(
+                                batch_noises, 512, 512, self.pipe.vae.config.scaling_factor
+                            )
+                            batch_noises = (
+                                batch_noises / self.pipe.vae.config.scaling_factor
+                            ) + self.pipe.vae.config.shift_factor
+                            batch_delta_noises = self.pipe._unpack_latents(
+                                batch_delta_noises, 512, 512, self.pipe.vae.config.scaling_factor
+                            )
+                            batch_delta_noises = (
+                                batch_delta_noises / self.pipe.vae.config.scaling_factor
+                            ) + self.pipe.vae.config.shift_factor
+                        decoded_noise = self.pipe.vae.decode(batch_noises).sample
+                        decoded_noise = (decoded_noise / 2 + 0.5).clamp(0, 1)
+                        decoded_delta_noise = self.pipe.vae.decode(batch_delta_noises).sample
+                        decoded_delta_noise = (decoded_delta_noise / 2 + 0.5).clamp(0, 1)
+                        
+                        noises.append(decoded_noise)
+                        delta_noises.append(decoded_delta_noise)
+
                     # Calculate rewards
-                    total_loss, metrics = self._compute_total_loss(images, batch_prompts)
+                    _, metrics = self._compute_total_loss(batch_images, batch_prompts)
                     for name, value in metrics.items():
                         if name in all_rewards:
                             all_rewards[name].append(value)
@@ -424,52 +422,56 @@ class NoiseNetworkTrainer:
                     dist.all_reduce(rewards_tensor, op=dist.ReduceOp.SUM)
                 eval_metrics[name] = rewards_tensor.sum().item() / total_samples if total_samples > 0 else 0.0
         
-        self.pipe.transformer.module.train()
-        self.pipe.transformer.module.enable_adapters()
-        self._cleanup_memory()
-        return eval_metrics
-
-    def _generate_images(self, init_latents: torch.Tensor, prompts: List[str], 
-                        noise_prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate images from latents and prompts."""
-        # Prepare latents
-        latents, extra_data = self.model_fns.prepare_latents_fn(self, init_latents, len(prompts))
-        
-        # Encode prompts
-        encoding_data = self.model_fns.encode_prompt_fn(self, prompts)
-        
-        if prompts != noise_prompts:
-            noise_encoding_data = self.model_fns.encode_prompt_fn(self, noise_prompts)
-        else:
-            noise_encoding_data = encoding_data
-        
-        if self.train_type == "noise":
-            self.pipe.transformer.module.enable_adapters()
-            pred_latents = self.model_fns.transformer_forward_fn(
-                self, latents, noise_encoding_data, extra_data
-            )
+        if return_imgs:
+            images = torch.cat(images, dim=0)
+            noises = torch.cat(noises, dim=0)
+            delta_noises = torch.cat(delta_noises, dim=0)
             
-            if self.config.enable_modulate_noise:
-                latents = pred_latents + latents
-            else:
-                latents = pred_latents
-            self.pipe.transformer.module.disable_adapters()
-        
-        images = self.model_fns.apply_fn(self, latents, encoding_data)
-        return images, latents
+            if self.runtime.world_size > 1:
+                dist.barrier()
+                
+                images = images.contiguous()
+                noises = noises.contiguous()
+                delta_noises = delta_noises.contiguous()
+                images_list = [torch.zeros_like(images) for _ in range(self.runtime.world_size)]
+                noises_list = [torch.zeros_like(noises) for _ in range(self.runtime.world_size)]
+                delta_noises_list = [torch.zeros_like(delta_noises) for _ in range(self.runtime.world_size)]
+                dist.all_gather(images_list, images)
+                dist.all_gather(noises_list, noises)
+                dist.all_gather(delta_noises_list, delta_noises)
+                
+                if self.runtime.rank == 0:
+                    images = torch.cat(images_list, dim=0)
+                    noises = torch.cat(noises_list, dim=0)
+                    delta_noises = torch.cat(delta_noises_list, dim=0)
+                else:
+                    images = torch.empty(0)
+                    noises = torch.empty(0)
+                    delta_noises = torch.empty(0)
+                    
+                dist.barrier()
+        else:
+            images = torch.empty(0)
+            noises = torch.empty(0)
+            delta_noises = torch.empty(0)
+
+        self.model_fns.get_noise_network(self).module.train()
+        self.model_fns.get_noise_network(self).module.enable_adapters()
+        self._cleanup_memory()
+        return images, noises, delta_noises, eval_metrics
 
     def save_model(self, save_dir: str, step: Optional[int] = None, is_best: bool = False):
         """Save model checkpoint."""
         if not self.runtime.log_metrics:
-            return
+            return 
             
         suffix = "best_model" if is_best else f"model_step{step}" if step else "final_model"
         adapter_save_directory = os.path.join(save_dir, suffix)
         os.makedirs(adapter_save_directory, exist_ok=True)
-        
-        self.pipe.transformer.module.enable_adapters()
-        model_with_adapter = self.pipe.transformer.module
-        
+
+        self.model_fns.get_noise_network(self).module.enable_adapters()
+        model_with_adapter = self.model_fns.get_noise_network(self).module
+
         # Save adapter weights
         peft_model_state_dict = get_peft_model_state_dict(
             model_with_adapter, adapter_name="hypernoise_adapter"
@@ -482,74 +484,70 @@ class NoiseNetworkTrainer:
         
         loss_info = f" (loss: {self.best_loss:.4f})" if is_best else ""
         logging.info(f"Successfully saved LoRA adapter to {adapter_save_directory}{loss_info}")
+        del model_with_adapter  # Free up memory
 
     def _periodic_evaluation(self, toy_eval_prompts: List[str], eval_prompts: List[str], 
                            save_dir: str, epoch: int, iter_idx: int, iter_step: int):
         """Perform periodic evaluation during training."""
         # Generate evaluation images
         if save_dir:
-            self._generate_and_save_eval_images(toy_eval_prompts, save_dir, epoch, iter_idx)
+            toy_metrics, toy_metrics_red = self._generate_and_save_eval_images(toy_eval_prompts, save_dir, epoch, iter_idx)
+            total_loss = toy_metrics.get("total", float('inf'))
+            self._log_metrics(toy_metrics, iter_step, "toy_eval_")
+            self._log_metrics(toy_metrics_red, iter_step, "toy_eval_red_")
+    
+        if self.config.compute_geneval_rewards:
+            # Evaluate on full eval set
+            _, _, geneval_metrics = self.gen_images_and_eval_rewards(eval_prompts, eval_prompts, 
+                                            self.config.eval_batch_size, num_samples=4, return_imgs=False)
+            red_prompts = ["red"] * len(eval_prompts)
+            _, _, geneval_metrics_red = self.gen_images_and_eval_rewards(eval_prompts, red_prompts, 
+                                                self.config.eval_batch_size, num_samples=4, return_imgs=False)
+            
+            total_loss = geneval_metrics.get("total", float('inf'))
         
-        # Evaluate on full eval set
-        geneval_metrics = self.eval_rewards(eval_prompts, eval_prompts, 
-                                          self.config.eval_batch_size, num_samples=4)
-        red_prompts = ["red"] * len(eval_prompts)
-        geneval_metrics_red = self.eval_rewards(eval_prompts, red_prompts, 
-                                              self.config.eval_batch_size, num_samples=4)
-        
-        # Update best model
-        if geneval_metrics.get("total", float('inf')) < self.best_loss:
-            self.best_loss = geneval_metrics["total"]
-            self.save_model(save_dir, is_best=True)
-        
-        # Log evaluation metrics
-        self._log_metrics(geneval_metrics, iter_step, "geneval_")
-        self._log_metrics(geneval_metrics_red, iter_step, "geneval_red_")
+            # Log evaluation metrics
+            self._log_metrics(geneval_metrics, iter_step, "geneval_")
+            self._log_metrics(geneval_metrics_red, iter_step, "geneval_red_")
         
         # Average recent training metrics
-        if self.metric_list:
+        if self.runtime.log_metrics and self.metric_list:
             avg_metrics = {}
             for key in self.metric_list[0].keys():
                 avg_metrics[key] = sum([m[key] for m in self.metric_list]) / len(self.metric_list)
             self._log_metrics(avg_metrics, iter_step, "train_")
-            self.metric_list = []  # Reset after logging
-        
+
+        # Update best model
+        if self.runtime.log_metrics:
+            if total_loss < self.best_loss:
+                self.best_loss = total_loss
+                self.save_model(save_dir, is_best=True)
+
         self._cleanup_memory()
 
     def _generate_and_save_eval_images(self, prompts: List[str], save_dir: str, epoch: int, iter_idx: int):
         """Generate and save evaluation images."""
-        generator = torch.Generator(self.runtime.device).manual_seed(self.runtime.seed)
-        init_latents = torch.randn(
-            [len(prompts), *self.latent_shape],
-            device=self.runtime.device,
-            dtype=self.runtime.dtype,
-            generator=generator,
-        )
-        
         # Regular evaluation
-        images, _ = self.eval_step(init_latents, self.config.eval_batch_size, prompts)
+        images, noises, delta_noises, rewards = self.gen_images_and_eval_rewards(prompts, prompts, self.config.eval_batch_size, num_samples=1, return_imgs=True)
         self._save_image_grid(images, save_dir, f"grid_epoch{epoch}_{iter_idx}.png")
-        
+        if self.config.viz_noise:
+            self._save_image_grid(noises, save_dir, f"grid_epoch{epoch}_{iter_idx}_decoded_noise.png")
+            self._save_image_grid(delta_noises, save_dir, f"grid_epoch{epoch}_{iter_idx}_decoded_delta_noise.png")
+
         # Red conditioning evaluation
         red_prompts = ["red"] * len(prompts)
-        images_red, _ = self.eval_step(init_latents, self.config.eval_batch_size, prompts, red_prompts)
+        images_red, noises_red, delta_noises_red, rewards_red = self.gen_images_and_eval_rewards(prompts, red_prompts, self.config.eval_batch_size, num_samples=1, return_imgs=True)
         self._save_image_grid(images_red, save_dir, f"grid_epoch{epoch}_{iter_idx}_red.png")
+        if self.config.viz_noise:
+            self._save_image_grid(noises_red, save_dir, f"grid_epoch{epoch}_{iter_idx}_red_decoded_noise.png")
+            self._save_image_grid(delta_noises_red, save_dir, f"grid_epoch{epoch}_{iter_idx}_red_decoded_delta_noise.png")
+        
+        return rewards, rewards_red
 
     def _save_image_grid(self, images: torch.Tensor, save_dir: str, filename: str):
-        """Save image grid with distributed gathering."""
-        if self.runtime.world_size > 1:
-            dist.barrier()
-            images = images.contiguous()
-            tensor_list = [torch.zeros_like(images) for _ in range(self.runtime.world_size)]
-            dist.all_gather(tensor_list, images)
-            full_images = torch.cat(tensor_list, dim=0).cpu()
-            dist.barrier()
-        else:
-            full_images = images.cpu()
-        
         if self.runtime.log_metrics:
             save_path = os.path.join(save_dir, filename)
-            save_image_grid(full_images, save_path, nrow=int(math.sqrt(full_images.size(0))))
+            save_image_grid(images, save_path, nrow=int(math.sqrt(images.size(0))))
 
     def train(self, prompt_loader: torch.utils.data.DataLoader, eval_prompts: List[str], 
               save_dir: Optional[str] = None, save_images: bool = False):
@@ -557,7 +555,7 @@ class NoiseNetworkTrainer:
         if self.runtime.log_metrics:
             logging.info(f"Training noise network for {self.config.epochs} epochs.")
         
-        toy_eval_prompts = self._load_eval_prompts()
+        toy_eval_prompts = self._load_visualization_eval_prompts()
         self.optimizer.zero_grad(set_to_none=True)
         
         for epoch in range(self.config.epochs):
@@ -594,7 +592,7 @@ class NoiseNetworkTrainer:
                     logging.info(f"Step time: {step_time:.4f} seconds, Post-processing time: {post_time:.4f} seconds")
                 
                 # Periodic evaluation and saving
-                if save_images and (iter_step + 1) % self.config.log_every == 0:
+                if save_images and (iter_step) % self.config.log_every == 0:
                     self._periodic_evaluation(toy_eval_prompts, eval_prompts, save_dir, epoch, iter_idx, iter_step)
                 
                 # Periodic checkpointing
@@ -606,11 +604,9 @@ class NoiseNetworkTrainer:
                 epoch_metrics = {}
                 for key in self.metric_list[0].keys():
                     epoch_metrics[key] = sum([m[key] for m in self.metric_list]) / len(self.metric_list)
-                
-                epoch_metrics_logged = {f"epoch_{k}": v for k, v in epoch_metrics.items()}
-                wandb.log(epoch_metrics_logged, step=int(epoch * len(prompt_loader)))
-                formatted_epoch_metrics = {k: f"{v:.4f}" for k, v in epoch_metrics.items()}
-                logging.info(f"Epoch {epoch} Metrics: {formatted_epoch_metrics}")
+                    
+                self._log_metrics(epoch_metrics, step=int(epoch * len(prompt_loader)), prefix="epoch_")
+                self.metric_list = []
         
         # Final save
         if save_dir:
@@ -631,7 +627,7 @@ def create_sana_functions() -> ModelFunctions:
     def encode_prompt_fn(trainer, prompts):
         return trainer.pipe.encode_prompt(prompt=prompts, device=trainer.runtime.device)
     
-    def transformer_forward_fn(trainer, latents, encoding_data, extra_data):
+    def noise_network_forward_fn(trainer, latents, encoding_data, extra_data):
         prompt_embeds, prompt_attention_mask = encoding_data
         # account for batches smaller than batch size
         guidance = trainer.guidance[:latents.shape[0]]
@@ -660,9 +656,11 @@ def create_sana_functions() -> ModelFunctions:
     return ModelFunctions(
         prepare_latents_fn=prepare_latents_fn,
         encode_prompt_fn=encode_prompt_fn,
-        transformer_forward_fn=transformer_forward_fn,
+        noise_network_forward_fn=noise_network_forward_fn,
         apply_fn=apply_fn,
         init_guidance_fn=init_guidance_fn,
+        get_noise_network=lambda trainer: trainer.pipe.transformer,
+        model_name="sana",
     )
 
 
@@ -686,7 +684,7 @@ def create_flux_functions() -> ModelFunctions:
             prompt=prompts, prompt_2=None, device=trainer.runtime.device
         )
     
-    def transformer_forward_fn(trainer, latents, encoding_data, extra_data):
+    def noise_network_forward_fn(trainer, latents, encoding_data, extra_data):
         prompt_embeds, pooled_prompt_embeds, text_ids = encoding_data
         latent_image_ids = extra_data
         
@@ -715,9 +713,61 @@ def create_flux_functions() -> ModelFunctions:
     return ModelFunctions(
         prepare_latents_fn=prepare_latents_fn,
         encode_prompt_fn=encode_prompt_fn,
-        transformer_forward_fn=transformer_forward_fn,
+        noise_network_forward_fn=noise_network_forward_fn,
         apply_fn=apply_fn,
+        get_noise_network=lambda trainer: trainer.pipe.transformer,
         init_guidance_fn=None,  # Flux doesn't need guidance initialization
+        model_name="flux",
+    )
+
+
+def create_sdturbo_functions() -> ModelFunctions:
+    """Create model functions for SDTurbo."""
+    
+    def prepare_latents_fn(trainer, init_latents, batch_size):
+        # SDTurbo uses latents directly
+        return init_latents, None
+    
+    def encode_prompt_fn(trainer, prompts):
+        prompt_embeds, _ = trainer.pipe.encode_prompt(
+            prompt=prompts,
+            device=trainer.runtime.device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=False,
+            negative_prompt=None,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
+            lora_scale=None,
+            clip_skip=False,
+        )
+        return prompt_embeds
+    
+    def noise_network_forward_fn(trainer, latents, encoding_data, extra_data):
+        prompt_embeds = encoding_data
+        return trainer.pipe.unet(
+            sample=latents,
+            timestep=999.0,
+            encoder_hidden_states=prompt_embeds,
+            return_dict=False,
+        )[0]
+    
+    def apply_fn(trainer, latents, encoding_data):
+        prompt_embeds = encoding_data
+        return trainer.pipe.apply(
+            latents=latents,
+            prompt_embeds=prompt_embeds,
+            num_inference_steps=1,
+            guidance_scale=0.0,
+        )
+    
+    return ModelFunctions(
+        prepare_latents_fn=prepare_latents_fn,
+        encode_prompt_fn=encode_prompt_fn,
+        noise_network_forward_fn=noise_network_forward_fn,
+        apply_fn=apply_fn,
+        get_noise_network=lambda trainer: trainer.pipe.unet,
+        init_guidance_fn=None,
+        model_name="sd-turbo",
     )
 
 
@@ -727,16 +777,10 @@ def create_trainer(model_type: str, **kwargs) -> NoiseNetworkTrainer:
     # Set model-specific configurations
     if model_type.lower() == "sana":
         model_functions = create_sana_functions()
-        # SANA-specific config adjustments
-        if 'training_config' in kwargs:
-            kwargs['training_config'].norm_dims = [1, 2, 3]  # SANA norm dimensions
-    
     elif model_type.lower() == "flux":
         model_functions = create_flux_functions()
-        # Flux-specific config adjustments
-        if 'training_config' in kwargs:
-            kwargs['training_config'].norm_dims = [1, 2]  # Flux norm dimensions
-    
+    elif model_type.lower() == "sd-turbo":
+        model_functions = create_sdturbo_functions()
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     

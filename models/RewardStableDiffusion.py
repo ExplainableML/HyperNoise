@@ -2,7 +2,15 @@ import inspect
 from typing import Callable, List, Optional, Union
 
 import torch
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionPipeline, AutoencoderKL, UNet2DConditionModel
+from diffusers.schedulers import KarrasDiffusionSchedulers
+from transformers import (
+    CLIPTextModel,
+    CLIPTokenizer,
+    CLIPImageProcessor,
+    CLIPVisionModelWithProjection,
+)
+from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 
 
 def freeze_params(params):
@@ -13,16 +21,16 @@ def freeze_params(params):
 class RewardStableDiffusion(StableDiffusionPipeline):
     def __init__(
         self,
-        vae,
-        text_encoder,
-        tokenizer,
-        unet,
-        scheduler,
-        safety_checker,
-        feature_extractor,
-        image_encoder=None,
+        vae: AutoencoderKL,
+        text_encoder: CLIPTextModel,
+        tokenizer: CLIPTokenizer,
+        unet: UNet2DConditionModel,
+        scheduler: KarrasDiffusionSchedulers,
+        safety_checker: StableDiffusionSafetyChecker,
+        feature_extractor: CLIPImageProcessor,
+        image_encoder: CLIPVisionModelWithProjection,
         requires_safety_checker: bool = True,
-        memsave=False,
+        memsave: bool = False,
     ):
         super().__init__(
             vae,
@@ -42,8 +50,6 @@ class RewardStableDiffusion(StableDiffusionPipeline):
         freeze_params(self.vae.parameters())
         freeze_params(self.unet.parameters())
         freeze_params(self.text_encoder.parameters())
-        self.unet = torch.compile(self.unet, mode="reduce-overhead", fullgraph=True)
-        self.vae = torch.compile(self.vae, mode="reduce-overhead", fullgraph=True) 
 
     def decode_latents_tensors(self, latents):
         latents = 1 / 0.18215 * latents
@@ -71,8 +77,8 @@ class RewardStableDiffusion(StableDiffusionPipeline):
         return_latents: bool = False,
     ) -> torch.Tensor:
         # 0. Default height and width to unet
-        height = height or self.unet.config.sample_size * self.vae_scale_factor
-        width = width or self.unet.config.sample_size * self.vae_scale_factor
+        height = height or self.unet.module.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.module.config.sample_size * self.vae_scale_factor
         # to deal with lora scaling and other possible forward hooks
 
         negative_prompt_embeds = None
@@ -152,7 +158,7 @@ class RewardStableDiffusion(StableDiffusionPipeline):
         )
 
         # 5. Prepare latent variables
-        num_channels_latents = self.unet.config.in_channels
+        num_channels_latents = self.unet.module.config.in_channels
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
@@ -176,12 +182,12 @@ class RewardStableDiffusion(StableDiffusionPipeline):
 
         # 6.2 Optionally get Guidance Scale Embedding
         timestep_cond = None
-        if self.unet.config.time_cond_proj_dim is not None:
+        if self.unet.module.config.time_cond_proj_dim is not None:
             guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(
                 batch_size * num_images_per_prompt
             )
             timestep_cond = self.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
+                guidance_scale_tensor, embedding_dim=self.unet.module.config.time_cond_proj_dim
             ).to(device=device, dtype=latents.dtype)
 
         # 7. Denoising loop

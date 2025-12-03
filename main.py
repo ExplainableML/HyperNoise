@@ -2,28 +2,23 @@ import blobfile as bf
 import json
 import logging
 import os
-from datetime import timedelta
 import torch.distributed as dist
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pytorch_lightning import seed_everything
 import peft
 import wandb
-import types
-from peft.tuners.lora.layer import Linear as LoraLinear
 
 from arguments import parse_args
-from models.utils import get_model, find_all_lora_candidates, scaled_base_lora_forward, patch_lora_layer
+from models import get_model, find_all_lora_candidates, scaled_base_lora_forward, patch_lora_layer
 from rewards import get_reward_losses
 from training import get_optimizer, get_lr_scheduler, get_datasets
-from training import (  # Import from your new trainer module
-    NoiseNetworkTrainer, 
+from training import (
     TrainingConfig, 
     RuntimeConfig, 
     create_trainer
 )
-from typing import List, Dict, Optional, Tuple, Union
-from torch.utils.data import DataLoader, Dataset
+from typing import List, Dict, Tuple
 import torch.nn as nn
 
 
@@ -42,10 +37,10 @@ def configure_logging(args, global_rank: int) -> str:
     """Configures logging for the training process."""
     settings: str = (
         f"reward-{args.train_type}_{args.model}"
-        f"_{args.seed}_lr{args.lr}_gc{args.grad_clip}_reg{args.reg_weight if args.enable_reg else '0'}_{args.reg_type}"
         f"_batchsize{args.batch_size}_accum{args.accumulation_steps}_latent{args.latent_type}"
-        f"{'_lora' + str(args.lora_rank)}{'_gradnorm' if args.grad_normalization else ''}"
-        f"{'_checkpoint' if args.use_checkpoint else ''}"
+        f"{'_lora' + str(args.lora_rank) + '_' + str(args.alpha_multiplier)}{'_checkpoint' if args.use_checkpoint else ''}"
+        f"{'_onepromptperbatch' if args.one_prompt_per_batch else ''}"
+        f"_{args.seed}_lr{args.lr}_gc{args.grad_clip}_reg{args.reg_weight if args.enable_reg else '0'}_{args.reg_type}"
     )
     bf.makedirs(f"{args.save_dir}/{args.task}/{settings}")
     bf.makedirs(f"{args.save_dir}/logs/{args.task}")  # Make sure logs dir exists
@@ -69,6 +64,7 @@ def initialize_wandb(args, global_rank: int, settings: str) -> None:
     """Initializes Weights & Biases for tracking the training process."""
     if global_rank == 0:
         wandb.init(
+            entity="lucaeyring",
             project="hypernoise",
             name=f"{args.task}_{settings}",
         )
@@ -94,6 +90,20 @@ def setup_model_with_lora(args, device: torch.device, global_rank: int, local_ra
             16 * 64,
             64,
         ]
+        noise_network = pipe.transformer
+    elif args.model.startswith("sd-turbo"):
+        # SD-Turbo latent shape format
+        height, width = 512, 512
+        
+        vae_scale_factor = pipe.vae_scale_factor
+        in_channels = pipe.unet.config.in_channels
+        
+        latent_shape = [
+            in_channels,
+            height // vae_scale_factor,
+            width // vae_scale_factor
+        ]
+        noise_network = pipe.unet
     else:
         # SANA and other models use standard format
         height, width = 1024, 1024
@@ -106,12 +116,13 @@ def setup_model_with_lora(args, device: torch.device, global_rank: int, local_ra
             height // vae_scale_factor,
             width // vae_scale_factor
         ]
+        noise_network = pipe.transformer
 
     if global_rank == 0:
         logging.info(f"Model: {args.model}, Latent shape: {latent_shape}")
 
     # Setup LoRA using your existing function
-    all_layers = find_all_lora_candidates(pipe.transformer)
+    all_layers = find_all_lora_candidates(noise_network)
     
     if global_rank == 0:
         logging.info(f"Found {len(all_layers)} LoRA target layers")
@@ -123,25 +134,30 @@ def setup_model_with_lora(args, device: torch.device, global_rank: int, local_ra
         init_lora_weights="gaussian",
         target_modules=all_layers,
     )
-    pipe.transformer.add_adapter(main_lora_config, adapter_name="hypernoise_adapter")
+    noise_network.add_adapter(main_lora_config, adapter_name="hypernoise_adapter")
     # patch final layer to be initialized with 0
     if args.train_type == "noise":
         patch_lora_layer(pipe, args.last_layer_name, global_rank)
-    
-    # Wrap with DDP
-    pipe.transformer = DDP(pipe.transformer, device_ids=[local_rank], output_device=local_rank)
-    
+
     # Log parameter count
-    params = [p for p in pipe.transformer.parameters() if p.requires_grad]
+    params = [p for p in noise_network.parameters() if p.requires_grad]
     if global_rank == 0:
         total_params = sum(p.numel() for p in params)
         trainable_params = sum(p.numel() for p in params if p.requires_grad)
         logging.info(f"Total parameters: {total_params:,}")
         logging.info(f"Trainable parameters: {trainable_params:,}")
 
-    pipe.transformer.module.train()
-    pipe.transformer.module.enable_adapters()
+    noise_network.train()
+    noise_network.enable_adapters()
     
+    # Wrap with DDP
+    noise_network = DDP(noise_network, device_ids=[local_rank], output_device=local_rank)
+    
+    if args.model == "sd-turbo":
+        pipe.unet = noise_network
+    else:
+        pipe.transformer = noise_network
+
     return pipe, latent_shape
 
 
@@ -149,8 +165,8 @@ def create_training_config(args) -> TrainingConfig:
     """Create training configuration from arguments."""
     return TrainingConfig(
         epochs=args.epochs,
-        batch_size=args.batch_size,
-        eval_batch_size=args.batch_size,
+        batch_size=args.batch_size // dist.get_world_size(),
+        eval_batch_size=args.batch_size // dist.get_world_size(),
         n_inference_steps=getattr(args, 'n_inference_steps', 1),
         regularize=args.enable_reg,
         regularization_weight=args.reg_weight,
@@ -161,9 +177,10 @@ def create_training_config(args) -> TrainingConfig:
         latent_type=args.latent_type,
         reg_type=args.reg_type,
         enable_modulate_noise=args.enable_modulate_noise,
-        grad_normalization=args.grad_normalization,
         one_prompt_per_batch=args.one_prompt_per_batch,
         use_checkpoint=args.use_checkpoint,
+        viz_noise=args.viz_noise,
+        compute_geneval_rewards=args.compute_geneval_rewards,
     )
 
 
@@ -210,7 +227,10 @@ def main(args) -> None:
     reward_losses = get_reward_losses(args, dtype, device, getattr(args, 'cache_dir', None))
     
     # Setup optimizer and scheduler
-    params = [p for p in pipe.transformer.parameters() if p.requires_grad]
+    if args.model == "sd-turbo":
+        params = [p for p in pipe.unet.parameters() if p.requires_grad]
+    else:
+        params = [p for p in pipe.transformer.parameters() if p.requires_grad]
     optimizer = get_optimizer(args.optim, params, args.lr, False)
     scheduler = get_lr_scheduler(optimizer, args.warmup_steps, world_size)
 

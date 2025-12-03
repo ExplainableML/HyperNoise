@@ -9,7 +9,7 @@ def parse_args():
         "--cache_dir",
         type=str,
         help="HF cache directory",
-        default=".",
+        default=".cache",
     )
     parser.add_argument(
         "--save_dir",
@@ -80,6 +80,7 @@ def parse_args():
         help="Task to run",
         default="single",
         choices=[
+            "single-prompts",
             "example-prompts",
             "geneval",
             "pickapic",
@@ -101,11 +102,13 @@ def parse_args():
     parser.add_argument("--accumulation_steps", type=int, help="Accumulation steps", default=1)
     parser.add_argument("--one_prompt_per_batch", default=False, action="store_true")
     parser.add_argument("--grad_normalization", default=False, action="store_true")
-    parser.add_argument("--train_type", type=str, help="Train type", default="noise")
+    parser.add_argument("--train_type", type=str, help="Train type", default="noise", choices=["noise", "finetune"])
     parser.add_argument(
         "--use_checkpoint", 
         action="store_true",
         help="Use gradient checkpointing to save memory during training"
     )
+    parser.add_argument("--viz_noise", default=False, action="store_true", help="Visualize the modulated noise")
+    parser.add_argument("--compute_geneval_rewards", default=True, action=argparse.BooleanOptionalAction, help="Compute geneval rewards during evaluation")
     args = parser.parse_args()
     return args

@@ -78,6 +78,15 @@ def get_datasets(args, global_rank: int, world_size: int) -> Tuple[Optional[Data
         else:
             prompt_loader: DataLoader = get_prompt_loader(prompts, args.batch_size // world_size, world_size, global_rank)
         return prompt_loader
+    elif args.task == "single-prompts":
+        with open("assets/single_prompts.txt", "r") as f:
+            prompts = [line.strip() for line in f.readlines()]
+        if args.one_prompt_per_batch:
+            prompt_loader: DataLoader = get_prompt_loader(prompts, 1, world_size, global_rank)
+        else:
+            prompt_loader: DataLoader = get_prompt_loader(prompts, args.batch_size // world_size, world_size, global_rank)
+        return prompt_loader
+        
     else:
         raise ValueError(f"Unknown task: {args.task}")
 

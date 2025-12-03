@@ -1,26 +1,10 @@
 import logging
-from typing import List, Optional
 import torch
-import torch.nn as nn
-import diffusers
-from safetensors.torch import load_file
 
 import logging
 import types
-from typing import Any, Optional
 import torch
-from diffusers import (
-    AutoencoderKL,
-    DDPMScheduler,
-    EulerDiscreteScheduler,
-    EulerAncestralDiscreteScheduler,
-    LCMScheduler,
-    Transformer2DModel,
-    UNet2DConditionModel,
-)
-from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
-from peft.tuners.lora.layer import Linear as LoraLinear
+from peft.tuners.lora.layer import LoraLayer
 
 from models.RewardStableDiffusion import RewardStableDiffusion
 from models.RewardSana import RewardSanaPipeline
@@ -48,12 +32,12 @@ def get_model(
         if memsave:
             import memsave_torch.nn
 
-            self.vae = memsave_torch.nn.convert_to_memory_saving(self.vae)
-            self.unet = memsave_torch.nn.convert_to_memory_saving(self.unet)
-            self.text_encoder = memsave_torch.nn.convert_to_memory_saving(
-                self.text_encoder
+            pipe.vae = memsave_torch.nn.convert_to_memory_saving(pipe.vae)
+            pipe.unet = memsave_torch.nn.convert_to_memory_saving(pipe.unet)
+            pipe.text_encoder = memsave_torch.nn.convert_to_memory_saving(
+                pipe.text_encoder
             )
-        self.text_encoder.gradient_checkpointing_enable()
+        pipe.text_encoder.gradient_checkpointing_enable()
     elif model_name == "sana":
         pipe = RewardSanaPipeline.from_pretrained(
             "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
@@ -96,8 +80,6 @@ def find_all_lora_candidates(model):
     
     # Look for Linear and Conv layers, including those nested inside other modules
     for name, module in model.named_modules():
-        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
-            continue
             
         # Direct Linear/Conv layers
         if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
@@ -157,28 +139,47 @@ def patch_lora_layer(pipe, target_layer_name: str, global_rank: int):
     
     patched_count = 0
     
-    for name, module in pipe.transformer.named_modules():
-        if name == target_layer_name and isinstance(module, LoraLinear):
-            if global_rank == 0:
-                logging.info(f"Found target LoRA layer '{name}' (Type: {type(module)}). Applying patch.")
-            
-            # Use your existing scaled_base_lora_forward function
-            module.forward = types.MethodType(scaled_base_lora_forward, module)
-            patched_count += 1
-            break
+    if target_layer_name == "conv_out":
+        for name, module in pipe.unet.named_modules():
+            if name == target_layer_name and isinstance(module, LoraLayer):
+                if global_rank == 0:
+                    logging.info(f"Found target LoRA layer '{name}' (Type: {type(module)}). Applying patch.")
+                
+                # Use your existing scaled_base_lora_forward function
+                module.forward = types.MethodType(scaled_base_lora_forward, module)
+                patched_count += 1
+                break
 
-    if global_rank == 0:
-        if patched_count > 0:
-            logging.info(f"Successfully patched {patched_count} layer(s) named '{target_layer_name}'.")
-            
-            # Verification
-            try:
+        if global_rank == 0:
+            if patched_count > 0:
+                logging.info(f"Successfully patched {patched_count} layer(s) named '{target_layer_name}'.")
+                
+                target_module = dict(pipe.unet.named_modules())[target_layer_name]
+                if target_module.forward.__func__ == scaled_base_lora_forward:
+                    logging.info(f"Verification successful: '{target_layer_name}'.forward is now scaled_base_lora_forward.")
+                else:
+                    logging.warning(f"Verification failed: '{target_layer_name}'.forward is not the new function.")
+            else:
+                logging.error(f"No LoRA layer with name '{target_layer_name}' was found.")
+    else:
+        for name, module in pipe.transformer.named_modules():
+            if name == target_layer_name and isinstance(module, LoraLayer):
+                if global_rank == 0:
+                    logging.info(f"Found target LoRA layer '{name}' (Type: {type(module)}). Applying patch.")
+                
+                # Use your existing scaled_base_lora_forward function
+                module.forward = types.MethodType(scaled_base_lora_forward, module)
+                patched_count += 1
+                break
+
+        if global_rank == 0:
+            if patched_count > 0:
+                logging.info(f"Successfully patched {patched_count} layer(s) named '{target_layer_name}'.")
+                
                 target_module = dict(pipe.transformer.named_modules())[target_layer_name]
                 if target_module.forward.__func__ == scaled_base_lora_forward:
                     logging.info(f"Verification successful: '{target_layer_name}'.forward is now scaled_base_lora_forward.")
                 else:
                     logging.warning(f"Verification failed: '{target_layer_name}'.forward is not the new function.")
-            except KeyError:
-                logging.error(f"Verification error: Could not access module named '{target_layer_name}'.")
-        else:
-            logging.error(f"No LoRA layer with name '{target_layer_name}' was found.")
+            else:
+                logging.error(f"No LoRA layer with name '{target_layer_name}' was found.")
