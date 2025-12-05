@@ -64,7 +64,6 @@ def initialize_wandb(args, global_rank: int, settings: str) -> None:
     """Initializes Weights & Biases for tracking the training process."""
     if global_rank == 0:
         wandb.init(
-            entity="lucaeyring",
             project="hypernoise",
             name=f"{args.task}_{settings}",
         )
